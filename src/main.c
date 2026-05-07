@@ -1,5 +1,6 @@
 #include <gint/display.h>
 #include <gint/keyboard.h>
+#include <gint/timer.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -15,6 +16,17 @@
 
 static uint8_t comp_buf[MAX_COMP_FRAME];
 static uint8_t frame_buf[BYTES_PER_FRAME];
+
+typedef struct {
+    const char *name;
+    const char *path;
+} video_entry;
+
+static video_entry video_list[] = {
+    { "Bad Apple",    "/fls0/bad-apple.bin" },
+    { "Rick Roll",    "/fls0/rick-roll.bin" },
+};
+static const int video_count = sizeof(video_list) / sizeof(video_list[0]);
 
 void display_mono(uint8_t *pixels) {
     for(int y = 0; y < TARGET_H; y++) {
@@ -37,16 +49,40 @@ static uint16_t read_u16_le(uint8_t *b) {
 
 int main(void)
 {
+    int selected = 0;
+
+    // Menu de sélection
+    while(1) {
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Video Player");
+        for(int i = 0; i < video_count; i++) {
+            if(i == selected)
+                dtext(1, 15 + i * 10, C_BLACK, ">");
+            dtext(10, 15 + i * 10, C_BLACK, video_list[i].name);
+        }
+        dtext(1, 50, C_BLACK, "FLECHES=naviguer");
+        dtext(1, 60, C_BLACK, "EXE=play AC/ON=quit");
+        dupdate();
+
+        key_event_t ev;
+        do { ev = pollevent(); } while(ev.type != KEYEV_DOWN);
+
+        if(ev.key == KEY_UP)   selected = (selected - 1 + video_count) % video_count;
+        if(ev.key == KEY_DOWN) selected = (selected + 1) % video_count;
+        if(ev.key == KEY_EXE)  break;
+        if(ev.key == KEY_ACON) return 1;
+    }
+
+    // Ouvrir le fichier sélectionné
     dclear(C_WHITE);
-    dtext(1, 1,  C_BLACK, "Bad Apple fx-9860G");
-    dtext(1, 15, C_BLACK, "Ouverture fichier...");
+    dtext(1, 1,  C_BLACK, "Ouverture fichier...");
     dupdate();
 
-    int fd = open("/fls0/bad-apple.bin", O_RDONLY);
+    int fd = open(video_list[selected].path, O_RDONLY);
     if(fd < 0) {
         dclear(C_WHITE);
         dtext(1, 1,  C_BLACK, "Erreur: fichier");
-        dtext(1, 15, C_BLACK, "/fls0/bad-apple.bin");
+        dtext(1, 15, C_BLACK, video_list[selected].path);
         dtext(1, 30, C_BLACK, "introuvable !");
         dtext(1, 45, C_BLACK, "AC/ON pour quitter");
         dupdate();
@@ -79,7 +115,7 @@ int main(void)
     // Afficher infos + attendre EXE
     char info1[32], info2[32];
     dclear(C_WHITE);
-    dtext(1, 1,  C_BLACK, "Bad Apple fx-9860G");
+    dtext(1, 1,  C_BLACK, video_list[selected].name);
     snprintf(info1, sizeof(info1), "%lu frames @ %lu fps", frame_count, fps);
     snprintf(info2, sizeof(info2), "Duree: %lu s", frame_count / fps);
     dtext(1, 15, C_BLACK, info1);
@@ -128,10 +164,13 @@ int main(void)
         key_event_t ev = pollevent();
         if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) break;
 
-        // Timing ~10fps : busy wait calibré pour SH3 ~30MHz
-        // 30000000 / 10 = 3000000 cycles, ~2 cycles/iter → 1500000 iter
-        // Ajuste ce facteur si trop rapide/lent
-        for(volatile int t = 0; t < 800000; t++);
+        // Attendre le prochain frame selon le fps
+        uint64_t delay_us = 1000000 / fps;
+        int t = timer_configure(TIMER_ANY, delay_us, GINT_CALL_NULL);
+        if(t >= 0) {
+            timer_spinwait(t);
+            timer_stop(t);
+        }
     }
 
     close(fd);
