@@ -47,66 +47,17 @@ static uint16_t read_u16_le(uint8_t *b) {
     return b[0] | (b[1]<<8);
 }
 
-int main(void)
+int play_video(const char *path, const char *name)
 {
-    int selected = 0;
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) return -1;
 
-    // Menu de sélection
-    while(1) {
-        dclear(C_WHITE);
-        dtext(1, 1, C_BLACK, "Video Player");
-        for(int i = 0; i < video_count; i++) {
-            if(i == selected)
-                dtext(1, 15 + i * 10, C_BLACK, ">");
-            dtext(10, 15 + i * 10, C_BLACK, video_list[i].name);
-        }
-        dtext(1, 50, C_BLACK, "FLECHES=naviguer");
-        dtext(1, 60, C_BLACK, "EXE=play AC/ON=quit");
-        dupdate();
-
-        key_event_t ev;
-        do { ev = pollevent(); } while(ev.type != KEYEV_DOWN);
-
-        if(ev.key == KEY_UP)   selected = (selected - 1 + video_count) % video_count;
-        if(ev.key == KEY_DOWN) selected = (selected + 1) % video_count;
-        if(ev.key == KEY_EXE)  break;
-        if(ev.key == KEY_ACON) return 1;
-    }
-
-    // Ouvrir le fichier sélectionné
-    dclear(C_WHITE);
-    dtext(1, 1,  C_BLACK, "Ouverture fichier...");
-    dupdate();
-
-    int fd = open(video_list[selected].path, O_RDONLY);
-    if(fd < 0) {
-        dclear(C_WHITE);
-        dtext(1, 1,  C_BLACK, "Erreur: fichier");
-        dtext(1, 15, C_BLACK, video_list[selected].path);
-        dtext(1, 30, C_BLACK, "introuvable !");
-        dtext(1, 45, C_BLACK, "AC/ON pour quitter");
-        dupdate();
-        while(1) {
-            key_event_t ev = pollevent();
-            if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) return 1;
-        }
-    }
-
-    // Lire header (16 octets)
     uint8_t header[16];
     read(fd, header, 16);
 
     if(memcmp(header, "FXZL", 4) != 0) {
-        dclear(C_WHITE);
-        dtext(1, 1,  C_BLACK, "Erreur: format");
-        dtext(1, 15, C_BLACK, "invalide !");
-        dtext(1, 30, C_BLACK, "AC/ON pour quitter");
-        dupdate();
         close(fd);
-        while(1) {
-            key_event_t ev = pollevent();
-            if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) return 1;
-        }
+        return -1;
     }
 
     uint32_t fps         = read_u32_le(header + 4);
@@ -115,13 +66,13 @@ int main(void)
     // Afficher infos + attendre EXE
     char info1[32], info2[32];
     dclear(C_WHITE);
-    dtext(1, 1,  C_BLACK, video_list[selected].name);
+    dtext(1, 1,  C_BLACK, name);
     snprintf(info1, sizeof(info1), "%lu frames @ %lu fps", frame_count, fps);
     snprintf(info2, sizeof(info2), "Duree: %lu s", frame_count / fps);
     dtext(1, 15, C_BLACK, info1);
     dtext(1, 25, C_BLACK, info2);
     dtext(1, 40, C_BLACK, "EXE=play");
-    dtext(1, 50, C_BLACK, "AC/ON=quit");
+    dtext(1, 50, C_BLACK, "AC/ON=menu");
     dupdate();
 
     while(1) {
@@ -129,61 +80,90 @@ int main(void)
         if(ev.type == KEYEV_DOWN && ev.key == KEY_EXE)  break;
         if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) {
             close(fd);
-            return 1;
+            return 0;
         }
     }
 
-    // Boucle lecture + affichage
+    // Boucle lecture (en boucle)
+    while(1) {
+        lseek(fd, 16, SEEK_SET);
 
-    for(uint32_t i = 0; i < frame_count; i++) {
-        // Lire taille compressée
-        uint8_t size_buf[2];
-        if(read(fd, size_buf, 2) < 2) break;
-        uint16_t comp_size = read_u16_le(size_buf);
+        for(uint32_t i = 0; i < frame_count; i++) {
+            uint8_t size_buf[2];
+            if(read(fd, size_buf, 2) < 2) break;
+            uint16_t comp_size = read_u16_le(size_buf);
 
-        if(comp_size > MAX_COMP_FRAME) {
-            // Skip frame corrompue
-            uint8_t tmp;
-            for(int s = 0; s < comp_size; s++) read(fd, &tmp, 1);
-            continue;
+            if(comp_size > MAX_COMP_FRAME) {
+                uint8_t tmp;
+                for(int s = 0; s < comp_size; s++) read(fd, &tmp, 1);
+                continue;
+            }
+
+            if(read(fd, comp_buf, comp_size) < comp_size) break;
+
+            size_t out_len = tinfl_decompress_mem_to_mem(frame_buf, BYTES_PER_FRAME,
+                             comp_buf, comp_size, TINFL_FLAG_PARSE_ZLIB_HEADER);
+
+            if(out_len > 0) {
+                dclear(C_WHITE);
+                display_mono(frame_buf);
+                dupdate();
+            }
+
+            // Timing précis
+            uint64_t delay_us = 1000000 / fps;
+            int t = timer_configure(TIMER_ANY, delay_us, GINT_CALL_NULL);
+            if(t >= 0) {
+                timer_spinwait(t);
+                timer_stop(t);
+            }
+
+            // Vérifier AC/ON
+            key_event_t ev = pollevent();
+            if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) break;
         }
 
-        // Lire données compressées
-        if(read(fd, comp_buf, comp_size) < comp_size) break;
+        // Fin de lecture ou AC/ON
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Fin de la video");
+        dtext(1, 15, C_BLACK, "AC/ON=menu");
+        dtext(1, 25, C_BLACK, "EXE=rejouer");
+        dupdate();
 
-        // Décompresser avec tinfl
-        size_t out_len = tinfl_decompress_mem_to_mem(frame_buf, BYTES_PER_FRAME, comp_buf, comp_size, TINFL_FLAG_PARSE_ZLIB_HEADER);
+        key_event_t ev;
+        do { ev = pollevent(); } while(ev.type != KEYEV_DOWN);
 
-        if(out_len > 0) {
-            dclear(C_WHITE);
-            display_mono(frame_buf);
-            dupdate();
-        }
-
-        // Vérifier quitter
-        key_event_t ev = pollevent();
-        if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) break;
-
-        // Attendre le prochain frame selon le fps
-        uint64_t delay_us = 1000000 / fps;
-        int t = timer_configure(TIMER_ANY, delay_us, GINT_CALL_NULL);
-        if(t >= 0) {
-            timer_spinwait(t);
-            timer_stop(t);
-        }
+        if(ev.key == KEY_ACON) break;
+        // EXE relance la boucle
     }
 
     close(fd);
+    return 0;
+}
 
-    dclear(C_WHITE);
-    dtext(1, 1,  C_BLACK, "Fin !");
-    dtext(1, 15, C_BLACK, "AC/ON pour quitter");
-    dupdate();
+int main(void)
+{
+    int selected = 0;
 
     while(1) {
-        key_event_t ev = pollevent();
-        if(ev.type == KEYEV_DOWN && ev.key == KEY_ACON) break;
-    }
+        // Menu de sélection
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Video Player");
+        for(int i = 0; i < video_count; i++) {
+            if(i == selected)
+                dtext(1, 15 + i * 10, C_BLACK, ">");
+            dtext(10, 15 + i * 10, C_BLACK, video_list[i].name);
+        }
+        dtext(1, 50, C_BLACK, "FLECHES=naviguer");
+        dtext(1, 60, C_BLACK, "EXE=play AC/ON=menu");
+        dupdate();
 
-    return 1;
+        key_event_t ev;
+        do { ev = pollevent(); } while(ev.type != KEYEV_DOWN);
+
+        if(ev.key == KEY_UP)   selected = (selected - 1 + video_count) % video_count;
+        if(ev.key == KEY_DOWN) selected = (selected + 1) % video_count;
+        if(ev.key == KEY_EXE)  play_video(video_list[selected].path, video_list[selected].name);
+        if(ev.key == KEY_ACON) return 1; // Retour au menu calculatrice
+    }
 }
